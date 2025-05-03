@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Chat Room</title>
+</head>
+<body>
+    <h2>Spring Boot WebSocket 聊天室</h2>
+    <div>
+        <input type="text" id="from" placeholder="你的名稱">
+        <input type="text" id="msg" placeholder="輸入訊息">
+        <button onclick="sendMessage()">送出</button>
+		<input type="file" id="imageInput" accept="image/*">
+		<button onclick="sendImage()">發送圖片</button>   
+		<button onclick="startCall()">啟動語音通話</button>
+		<audio id="remoteAudio" autoplay></audio>		     
+    </div>
+<!--     <ul id="chatbox"></ul> -->
+    <ul id="chatbox" style="height: 300px; overflow-y: scroll; border: 1px solid #ccc;"></ul>
+    
+
+    <!-- 引入 SockJS 與 STOMP 套件 -->
+    <script src="https://cdn.jsdelivr.net/npm/sockjs-client@1/dist/sockjs.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/stompjs@2.3.3/lib/stomp.min.js"></script>
+
+    <script>
+		// 自動讀取網址上的 ?name= 參數
+	    function getUserNameFromURL() {
+	        const params = new URLSearchParams(window.location.search);
+	        return params.get("name") || "";
+	    }
+	
+	    window.onload = function () {
+	        const name = getUserNameFromURL();
+	        document.getElementById("from").value = name;
+	    };    
+    
+        var stompClient = null;
+        
+        let signalStomp = null;
+        let peerConnection = null;
+
+        const rtcConfig = {
+            iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+        };        
+
+        function connect() {
+            var socket = new SockJS('/chat');
+            stompClient = Stomp.over(socket);
+            stompClient.connect({}, function (frame) {
+                console.log('Connected: ' + frame);
+                stompClient.subscribe('/topic/messages', function (message) {
+                    const msg = JSON.parse(message.body);
+                    showMessage(msg.from + ": " + msg.content, msg.from);
+                });
+            });
+        }
+
+        function sendMessage() {
+            var from = document.getElementById("from").value;
+            var content = document.getElementById("msg").value;
+            stompClient.send("/app/send", {}, JSON.stringify({'from': from, 'content': content}));
+            document.getElementById("msg").value = '';
+        }
+
+        function showMessage(message, fromUser) {
+            const chatbox = document.getElementById("chatbox");
+            const li = document.createElement("li");
+
+            if (fromUser === document.getElementById("from").value) {
+                li.style.color = "blue";
+            } else {
+                li.style.color = "green";
+            }
+
+            li.innerHTML = message; // ⚠️ 用 innerHTML 支援圖片顯示
+            chatbox.appendChild(li);
+            chatbox.scrollTop = chatbox.scrollHeight;
+        }
+
+        function sendImage() {
+            const fileInput = document.getElementById("imageInput");
+            const file = fileInput.files[0];
+            const from = document.getElementById("from").value;
+
+            if (!file) {
+                alert("請選擇圖片");
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = function (event) {
+                const base64Image = event.target.result; // base64 字串
+
+                stompClient.send("/app/send", {}, JSON.stringify({
+                    from: from,
+                    content: "<img src='" + base64Image + "' style='max-width:200px;'/>"
+                }));
+            };
+            reader.readAsDataURL(file);
+        }
+
+        connect();
+        
+        function connectSignaling() {
+            const socket = new SockJS('/signal');
+            signalStomp = Stomp.over(socket);
+            signalStomp.connect({}, function () {
+                signalStomp.subscribe('/topic/signal', function (message) {
+                    const data = JSON.parse(message.body);
+                    const localName = document.getElementById("from").value;
+                    if (data.from === localName) return;
+
+                    if (data.type === "offer") {
+                        peerConnection = new RTCPeerConnection(rtcConfig);
+                        handleRemote(peerConnection);
+
+                        peerConnection.setRemoteDescription(new RTCSessionDescription(data.sdp))
+                            .then(() => navigator.mediaDevices.getUserMedia({ audio: true }))
+                            .then(stream => {
+                                stream.getTracks().forEach(track => peerConnection.addTrack(track, stream));
+                                return peerConnection.createAnswer();
+                            })
+                            .then(answer => peerConnection.setLocalDescription(answer))
+                            .then(() => {
+                                signalStomp.send("/app/signal", {}, JSON.stringify({
+                                    type: "answer",
+                                    from: localName,
+                                    sdp: peerConnection.localDescription
+                                }));
+                            });
+                    } else if (data.type === "answer") {
+                        peerConnection.setRemoteDescription(new RTCSessionDescription(data.sdp));
+                    } else if (data.type === "candidate") {
+                        peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+                    }
+                });
+            });
+        }
+
+        function startCall() {
+            const localName = document.getElementById("from").value;
+
+            peerConnection = new RTCPeerConnection(rtcConfig);
+            handleRemote(peerConnection);
+
+            peerConnection.onicecandidate = function (event) {
+                if (event.candidate) {
+                    signalStomp.send("/app/signal", {}, JSON.stringify({
+                        type: "candidate",
+                        from: localName,
+                        candidate: event.candidate
+                    }));
+                }
+            };
+
+            navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+                stream.getTracks().forEach(track => peerConnection.addTrack(track, stream));
+                return peerConnection.createOffer();
+            }).then(offer => {
+                return peerConnection.setLocalDescription(offer);
+            }).then(() => {
+                signalStomp.send("/app/signal", {}, JSON.stringify({
+                    type: "offer",
+                    from: localName,
+                    sdp: peerConnection.localDescription
+                }));
+            });
+        }
+
+        
+        function handleRemote(pc) {
+            pc.ontrack = function (event) {
+                document.getElementById("remoteAudio").srcObject = event.streams[0];
+            };
+        }
+
+        window.onload = function () {
+            const name = getUserNameFromURL();
+            document.getElementById("from").value = name;
+            connect();
+            connectSignaling();
+        };
+
+    </script>
+</body>
+</html>
